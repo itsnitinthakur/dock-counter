@@ -2,7 +2,7 @@
 
 Usage examples:
   python dock_counter.py --source unloading.mp4 --line 100 400 1180 400
-  python dock_counter.py --source rtsp://user:pass@192.168.1.20/stream1 \
+  python dock_counter.py --source "rtsp://user:pass@192.168.1.108:554/cam/realmonitor?channel=1&subtype=0" \
       --model bags.pt --line 100 400 1180 400 --picking WH/IN/00012 --push
 
 --line x1 y1 x2 y2 : the virtual line across the door or dock, in pixels.
@@ -14,10 +14,12 @@ model on photos of your bags and cartons (see README) and pass it with --model.
 """
 import argparse
 import os
-import time
 from datetime import datetime
 
-import cv2
+# RTSP over TCP is more reliable for CCTV streams (CP Plus, Hikvision, Dahua).
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+
+import cv2  # noqa: E402
 from ultralytics import YOLO
 
 from line_counter import LineCounter
@@ -54,6 +56,7 @@ def main():
 
     started = datetime.now()
     last_frame = None
+    per_class = {}  # item type -> {"in": n, "out": n}
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -68,9 +71,14 @@ def main():
         if result.boxes is not None and result.boxes.id is not None:
             boxes = result.boxes.xyxy.cpu().numpy()
             ids = result.boxes.id.int().cpu().tolist()
-            for (x1, y1, x2, y2), track_id in zip(boxes, ids):
+            class_ids = result.boxes.cls.int().cpu().tolist()
+            for (x1, y1, x2, y2), track_id, class_id in zip(boxes, ids, class_ids):
                 centre = (float((x1 + x2) / 2), float((y1 + y2) / 2))
                 event = counter.update(track_id, centre)
+                if event:
+                    # Also keep separate totals per item type (e.g. carton, paper_roll).
+                    name = model.names[class_id]
+                    per_class.setdefault(name, {"in": 0, "out": 0})[event] += 1
                 if args.show:
                     cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 200, 0), 2)
                     cv2.putText(frame, str(track_id), (int(x1), int(y1) - 5),
@@ -93,6 +101,8 @@ def main():
 
     summary = (f"Started {started:%Y-%m-%d %H:%M}, finished {datetime.now():%H:%M}. "
                f"In: {counter.in_count}, Out: {counter.out_count}, Net: {counter.net}")
+    for name, c in sorted(per_class.items()):
+        summary += f"\n  {name}: in {c['in']}, out {c['out']}"
     print(summary)
     with open(os.path.join(args.save_dir, "summary.txt"), "w") as f:
         f.write(summary + "\n")
